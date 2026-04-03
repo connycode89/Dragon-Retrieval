@@ -1,15 +1,22 @@
 """
 Census / historical demographics loader.
 
-The 1901/1911 Irish Census has no public API or bulk download.
-This module provides the best available free alternatives:
+The 1901/1911 Irish Census has no public API or bulk download from the
+National Archives. This module uses the best available free alternatives:
 
-  1. CSO historical county-level statistics (data.cso.ie open data)
-  2. Wikipedia demographic sections for Irish counties and townlands
-     (scraped via the free MediaWiki API)
+  1. Wikidata SPARQL — historical population figures for named Irish places
+     (free, no auth, query via https://query.wikidata.org)
+  2. data.gov.ie CKAN API — aggregate historical datasets and townland data
+     (free, no auth, https://data.gov.ie/pages/developers)
+  3. Wikipedia demographic articles — rich narrative context
 
-TODO: If the National Archives ever releases a bulk export, replace
-      _load_cso_data() with a proper structured loader.
+For full individual-level 1901/1911 microdata (4.4M person records each),
+register at IPUMS International: https://international.ipums.org/international/
+They require a free account + signed educational-use license, and offer
+CSV exports. This is out of scope for automated ingestion but worth knowing.
+
+Note: The 1926 Census (first Free State census) was released April 2026
+at nationalarchives.ie — no API yet but web-searchable.
 """
 
 import httpx
@@ -17,45 +24,156 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 from langchain_core.documents import Document
 from config import WIKIPEDIA_API_BASE
 
-# CSO (Central Statistics Office) open data API
-# Historical tables available at: https://data.cso.ie
-CSO_API_BASE = "https://data.cso.ie/api"
+WIKIDATA_SPARQL_URL = "https://query.wikidata.org/sparql"
+DATA_GOV_IE_API = "https://data.gov.ie/api/3/action"
 
-# Wikipedia articles that contain reliable 1901/1911 demographic info
+# Wikipedia articles with reliable Irish historical demographic content
 CENSUS_WIKI_ARTICLES = [
     "Census in Ireland",
     "Demographics of the Republic of Ireland",
-    "Irish people",
     "Population history of Ireland",
     "Gaeltacht",
     "Irish language",
     "Great Famine (Ireland)",
     "Irish diaspora",
+    "Townland",
 ]
+
+# Wikidata SPARQL: Irish places with historical population data
+# Fetches places with a population statement that has a point-in-time qualifier
+WIKIDATA_POPULATION_QUERY = """
+SELECT ?place ?placeLabel ?population ?pointInTime ?countyLabel WHERE {
+  ?place wdt:P17 wd:Q22890 .          # located in Ireland
+  ?place p:P1082 ?populationStatement .
+  ?populationStatement ps:P1082 ?population .
+  OPTIONAL { ?populationStatement pq:P585 ?pointInTime . }
+  OPTIONAL { ?place wdt:P131 ?county .
+             ?county wdt:P31 wd:Q179872 . }  # county of Ireland
+  FILTER(?population > 0)
+  SERVICE wikibase:label { bd:serviceParam wikibase:language "en" . }
+}
+ORDER BY ?placeLabel
+LIMIT 2000
+"""
+
+# data.gov.ie CKAN search terms likely to return historical datasets
+DATA_GOV_SEARCH_TERMS = ["census townland", "historical population ireland", "griffiths valuation"]
 
 
 class CensusLoader:
     """
     Load historical demographic context from free public sources.
 
-    Since the 1901/1911 census has no API, this combines:
-    - Wikipedia articles on Irish demographics and history
-    - CSO open data for aggregate statistics
+    Sources (all free, no API key required):
+    - Wikidata SPARQL for historical population figures on named places
+    - data.gov.ie CKAN API for aggregate datasets
+    - Wikipedia for narrative demographic context
     """
 
     def __init__(self):
-        self.client = httpx.Client(timeout=30)
+        self.client = httpx.Client(
+            timeout=30,
+            headers={"User-Agent": "DragonRetrieval/1.0 (educational project)"},
+        )
 
     def load_all(self) -> list[Document]:
         """Load all available demographic context documents."""
         docs = []
+        docs.extend(self._load_wikidata_populations())
+        docs.extend(self._load_data_gov_ie())
         docs.extend(self._load_wikipedia_demographics())
-        docs.extend(self._load_cso_data())
+        return docs
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=8))
+    def _load_wikidata_populations(self) -> list[Document]:
+        """
+        Query Wikidata SPARQL for historical population figures of Irish places.
+        Groups results by place into one Document per place.
+        """
+        try:
+            response = self.client.get(
+                WIKIDATA_SPARQL_URL,
+                params={"query": WIKIDATA_POPULATION_QUERY, "format": "json"},
+                headers={"Accept": "application/sparql-results+json"},
+                timeout=45,
+            )
+            response.raise_for_status()
+            results = response.json().get("results", {}).get("bindings", [])
+        except Exception as e:
+            print(f"  [census] Wikidata SPARQL unavailable: {e}")
+            return []
+
+        # Group population records by place
+        by_place: dict[str, dict] = {}
+        for row in results:
+            label = row.get("placeLabel", {}).get("value", "")
+            pop = row.get("population", {}).get("value", "")
+            year = row.get("pointInTime", {}).get("value", "")[:4] if row.get("pointInTime") else "unknown"
+            county = row.get("countyLabel", {}).get("value", "")
+
+            if not label or label.startswith("Q"):  # skip unlabelled Wikidata items
+                continue
+
+            if label not in by_place:
+                by_place[label] = {"county": county, "records": []}
+            by_place[label]["records"].append(f"{year}: {pop} people")
+
+        docs = []
+        for place_name, info in by_place.items():
+            lines = [f"Place: {place_name}"]
+            if info["county"]:
+                lines.append(f"County: {info['county']}")
+            lines.append("Historical population:")
+            lines.extend(f"  - {r}" for r in sorted(info["records"]))
+            docs.append(Document(
+                page_content="\n".join(lines),
+                metadata={
+                    "source": "census_wikidata",
+                    "name_en": place_name,
+                    "county": info["county"],
+                    "url": "https://query.wikidata.org",
+                },
+            ))
+
+        print(f"  [census] Wikidata: {len(docs)} Irish places with historical population data")
+        return docs
+
+    def _load_data_gov_ie(self) -> list[Document]:
+        """
+        Query the data.gov.ie CKAN API for historical Irish datasets.
+        Returns metadata documents describing available datasets.
+        """
+        docs = []
+        for term in DATA_GOV_SEARCH_TERMS:
+            try:
+                response = self.client.get(
+                    f"{DATA_GOV_IE_API}/package_search",
+                    params={"q": term, "rows": 5},
+                    timeout=15,
+                )
+                if response.status_code != 200:
+                    continue
+                results = response.json().get("result", {}).get("results", [])
+                for dataset in results:
+                    text = self._dataset_to_text(dataset)
+                    if text:
+                        docs.append(Document(
+                            page_content=text,
+                            metadata={
+                                "source": "data_gov_ie",
+                                "dataset_id": dataset.get("id", ""),
+                                "url": f"https://data.gov.ie/dataset/{dataset.get('name', '')}",
+                            },
+                        ))
+            except Exception:
+                continue
+
+        print(f"  [census] data.gov.ie: {len(docs)} dataset descriptions loaded")
         return docs
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=8))
     def _load_wikipedia_demographics(self) -> list[Document]:
-        """Fetch Wikipedia articles about Irish demographics."""
+        """Fetch Wikipedia articles about Irish demographics for narrative context."""
         params = {
             "action": "query",
             "titles": "|".join(CENSUS_WIKI_ARTICLES),
@@ -63,9 +181,13 @@ class CensusLoader:
             "explaintext": True,
             "format": "json",
         }
-        response = self.client.get(WIKIPEDIA_API_BASE, params=params)
-        response.raise_for_status()
-        data = response.json()
+        try:
+            response = self.client.get(WIKIPEDIA_API_BASE, params=params)
+            response.raise_for_status()
+            data = response.json()
+        except Exception as e:
+            print(f"  [census] Wikipedia unavailable: {e}")
+            return []
 
         docs = []
         pages = data.get("query", {}).get("pages", {})
@@ -83,48 +205,26 @@ class CensusLoader:
                         "url": f"https://en.wikipedia.org/wiki/{title.replace(' ', '_')}",
                     },
                 ))
+
+        print(f"  [census] Wikipedia: {len(docs)} demographic articles loaded")
         return docs
 
-    def _load_cso_data(self) -> list[Document]:
-        """
-        Attempt to load aggregate statistics from CSO open data.
-        Returns empty list gracefully if the endpoint is unavailable.
+    def _dataset_to_text(self, dataset: dict) -> str:
+        """Convert a CKAN dataset record to readable text."""
+        title = dataset.get("title", "")
+        notes = (dataset.get("notes") or "").strip()
+        tags = [t.get("name", "") for t in dataset.get("tags", [])]
+        resources = [r.get("name", "") for r in dataset.get("resources", [])]
 
-        CSO open data portal: https://data.cso.ie
-        Historical census tables are available but endpoint stability varies.
-        """
-        try:
-            # Population by county from historical censuses
-            url = f"{CSO_API_BASE}/1.0/dataset/VSA08/data?format=JSON"
-            response = self.client.get(url, timeout=15)
-            if response.status_code != 200:
-                return []
-
-            data = response.json()
-            text = self._cso_json_to_text(data, "Historical Irish Population by County")
-            if text:
-                return [Document(
-                    page_content=text,
-                    metadata={"source": "cso", "dataset": "VSA08", "url": url},
-                )]
-        except Exception:
-            pass
-
-        return []
-
-    def _cso_json_to_text(self, data: dict, title: str) -> str:
-        """Convert a CSO JSON-stat dataset to readable text."""
-        try:
-            dims = data.get("dimension", {})
-            values = data.get("value", [])
-            if not dims or not values:
-                return ""
-            lines = [title]
-            # Simple flattening — CSO JSON-stat can be complex
-            for k, v in dims.items():
-                cats = v.get("category", {}).get("label", {})
-                if cats:
-                    lines.append(f"{k}: {', '.join(list(cats.values())[:10])}")
-            return "\n".join(lines)
-        except Exception:
+        if not title:
             return ""
+
+        parts = [f"Dataset: {title}"]
+        if notes:
+            parts.append(notes[:400])
+        if tags:
+            parts.append(f"Tags: {', '.join(tags)}")
+        if resources:
+            parts.append(f"Files: {', '.join(resources[:5])}")
+
+        return "\n".join(parts)
